@@ -218,7 +218,7 @@ function idRegistroDe(ingreso) {
 }
 
 // ========== INVENTARIO (un documento por producto) ==========
-// registro_inventario_unilevel: { EAN, DESC, CANTIDAD, FECHA_REGISTRO, HORA_REGISTRO, ID_REGISTRO, ESTADO }
+// registro_inventario_unilevel: { EAN, DESC, CANTIDAD, FECHA_REGISTRO, HORA_REGISTRO, ID_REGISTRO, ESTADO, MARCA }
 async function documentosDeVisita(idRegistro) {
     const docs = await consultarColeccion(COLECCIONES.registros, { ID_REGISTRO: idRegistro });
     return docs.filter(d => mismoValor(d.ID_REGISTRO, idRegistro) && d.EAN !== undefined && d.EAN !== null);
@@ -399,6 +399,7 @@ app.put("/api/registros/:id/producto", manejar(async (req, res) => {
                 ...fechaHora,
                 ID_REGISTRO: idRegistro,
                 ESTADO: PRODUCTO_PENDIENTE,
+                MARCA: producto.MARCA,
             };
             const insertId = await crearDocumento(COLECCIONES.registros, nuevo);
             docs = insertId
@@ -477,6 +478,7 @@ app.post("/api/registros/:id/marcas/:marca/finalizar", manejar(async (req, res) 
                     ...fechaHora,
                     ID_REGISTRO: idRegistro,
                     ESTADO: PRODUCTO_FINALIZADO,
+                    MARCA: p.MARCA,
                 }));
             } else if (cantidad !== undefined && cantidad !== Number(doc.CANTIDAD)) {
                 operaciones.push(() => actualizarDocumento(COLECCIONES.registros, doc._id, {
