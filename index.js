@@ -28,14 +28,23 @@ const COLECCIONES = {
     registros: `${API_BASE_URL}/registro_inventario_unilevel`,
 };
 
-// Campo de cédula en usuarios_unilevel y pdv_registro_unilevel
-const CAMPO_CEDULA = "CEDULA";
-// Zona horaria para decidir qué ingresos son "de hoy"
 const ZONA_HORARIA = "America/Bogota";
-
 const CANTIDAD_MAXIMA = 999999;
-const ESTADO_EN_PROCESO = "EN_PROCESO";
-const ESTADO_FINALIZADA = "FINALIZADA";
+
+// Estados del ingreso al punto (pdv_registro_unilevel), los mismos que usa el chatbot
+const PDV_EN_PUNTO = "EN PUNTO";
+const PDV_FUERA_DE_PUNTO = "FUERA DE PUNTO";
+
+// Estados de cada producto en registro_inventario_unilevel
+const PRODUCTO_PENDIENTE = "PENDIENTE";
+const PRODUCTO_FINALIZADO = "FINALIZADO";
+
+// Estados de marca en la respuesta al front
+const MARCA_EN_PROCESO = "EN_PROCESO";
+const MARCA_FINALIZADA = "FINALIZADA";
+
+// Cuántos POST simultáneos se envían al finalizar una marca
+const ENVIOS_SIMULTANEOS = 5;
 
 // ========== CORS: solo GitHub Pages (y los orígenes configurados) ==========
 app.use(cors({
@@ -63,14 +72,19 @@ const ahora = () => new Date().toISOString();
 
 // Limpia espacios dobles y finales ("REXONA " -> "REXONA", "3D  LIQ" -> "3D LIQ")
 const normalizarMarca = marca => String(marca || "").trim().replace(/\s+/g, " ").toUpperCase();
+const normalizarEstado = estado => String(estado || "").trim().replace(/\s+/g, " ").toUpperCase();
 
 const soloDigitos = valor => /^\d+$/.test(String(valor || "").trim());
+const mismoValor = (a, b) => a !== undefined && a !== null && String(a).trim() === String(b).trim();
 
-async function consultarColeccion(url) {
-    const response = await fetch(url, { headers: AUTH_HEADERS });
+// GET a una colección; la API permite filtrar por igualdad con query params (?CAMPO=valor)
+async function consultarColeccion(url, filtros = {}) {
+    const query = new URLSearchParams(filtros).toString();
+    const destino = query ? `${url}?${query}` : url;
+    const response = await fetch(destino, { headers: AUTH_HEADERS });
     if (!response.ok) {
         const errorBody = await response.text();
-        console.error(`❌ ${url} respondió ${response.status}:`, errorBody);
+        console.error(`❌ ${destino} respondió ${response.status}:`, errorBody);
         throw new ErrorApi(502, "No pudimos consultar la información. Intenta de nuevo.");
     }
     const data = await response.json();
@@ -108,15 +122,17 @@ async function actualizarDocumento(url, id, campos) {
     }
 }
 
-// "YYYY-MM-DD" en hora de Colombia. Los "created" de la base vienen en UTC sin zona.
-function diaLocal(fecha) {
-    const texto = String(fecha || "");
-    const d = new Date(/[zZ]|[+-]\d{2}:?\d{2}$/.test(texto) ? texto : `${texto}Z`);
-    if (Number.isNaN(d.getTime())) return null;
-    return new Intl.DateTimeFormat("en-CA", { timeZone: ZONA_HORARIA }).format(d);
+// Fecha sin hora ("2026-10-14T00:00:00") y hora aparte ("15:46:32"), en hora de Colombia
+function fechaYHoraLocal() {
+    const d = new Date();
+    const dia = new Intl.DateTimeFormat("en-CA", { timeZone: ZONA_HORARIA }).format(d);
+    const hora = new Intl.DateTimeFormat("en-GB", {
+        timeZone: ZONA_HORARIA, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+    }).format(d);
+    return { FECHA_REGISTRO: `${dia}T00:00:00`, HORA_REGISTRO: hora };
 }
 
-// Serializa las operaciones sobre un mismo registro para no pisar cambios simultáneos
+// Serializa las operaciones sobre una misma visita para no pisar cambios simultáneos
 const bloqueos = new Map();
 function conBloqueo(clave, fn) {
     const anterior = bloqueos.get(clave) || Promise.resolve();
@@ -125,6 +141,14 @@ function conBloqueo(clave, fn) {
     bloqueos.set(clave, cola);
     cola.then(() => { if (bloqueos.get(clave) === cola) bloqueos.delete(clave); });
     return actual;
+}
+
+async function enParalelo(items, limite, fn) {
+    let siguiente = 0;
+    const trabajadores = Array.from({ length: Math.min(limite, items.length) }, async () => {
+        while (siguiente < items.length) await fn(items[siguiente++]);
+    });
+    await Promise.all(trabajadores);
 }
 
 // ========== PRODUCTOS (con caché corta: el catálogo cambia poco) ==========
@@ -154,67 +178,115 @@ async function productosDeMarca(marca) {
     return (await obtenerProductos()).filter(p => p.MARCA === objetivo);
 }
 
-// ========== USUARIOS Y PUNTO DE VENTA ==========
+// ========== USUARIOS E INGRESOS AL PUNTO ==========
 async function buscarUsuario(cedula) {
-    const usuarios = await consultarColeccion(COLECCIONES.usuarios);
-    return usuarios.find(u =>
-        u[CAMPO_CEDULA] !== undefined && u[CAMPO_CEDULA] !== null &&
-        u[CAMPO_CEDULA].toString().trim() === cedula
-    ) || null;
+    const usuarios = await consultarColeccion(COLECCIONES.usuarios, { CEDULA: cedula });
+    return usuarios.find(u => mismoValor(u.CEDULA, cedula)) || null;
 }
 
-// Día del ingreso: FECHA_REGISTRO ya viene en fecha local ("2026-10-07T00:00:00");
-// si no viene, se usa "created" (UTC) convertido a hora de Colombia
-function diaDeIngreso(ingreso) {
-    const fecha = String(ingreso.FECHA_REGISTRO || "");
-    return /^\d{4}-\d{2}-\d{2}/.test(fecha) ? fecha.slice(0, 10) : diaLocal(ingreso.created);
-}
-
-// El chatbot registra en pdv_registro_unilevel a qué punto va la persona.
-// Se toma el ingreso MÁS RECIENTE de HOY para esa cédula.
-async function buscarIngresoDeHoy(cedula) {
-    const hoy = diaLocal(new Date().toISOString());
-    const ingresos = await consultarColeccion(COLECCIONES.ingresosPdv);
+// El chatbot registra en pdv_registro_unilevel el punto que la persona visita.
+// Se toma el ingreso MÁS RECIENTE de esa cédula.
+async function buscarUltimoIngreso(cedula) {
+    const ingresos = await consultarColeccion(COLECCIONES.ingresosPdv, { CEDULA: cedula });
     return ingresos
-        .filter(i =>
-            i[CAMPO_CEDULA] !== undefined && i[CAMPO_CEDULA] !== null &&
-            i[CAMPO_CEDULA].toString().trim() === cedula &&
-            diaDeIngreso(i) === hoy
-        )
+        .filter(i => mismoValor(i.CEDULA, cedula))
         .sort((a, b) => String(b.created).localeCompare(String(a.created)))[0] || null;
 }
 
-// pdv_registro_unilevel: { SAP, PDV, CIUDAD, CEDULA, NOMBRE, TELEFONO, FECHA_REGISTRO, created }
-function puntoVentaDesdeIngreso(ingreso) {
+async function obtenerIngresoOError(id) {
+    const ingresos = await consultarColeccion(COLECCIONES.ingresosPdv, { _id: id });
+    const ingreso = ingresos.find(i => String(i._id) === String(id));
+    if (!ingreso) throw new ErrorApi(404, "No encontramos tu visita al punto de venta. Vuelve a ingresar tu cédula.");
+    return ingreso;
+}
+
+const estaEnPunto = ingreso => normalizarEstado(ingreso.ESTADO) === PDV_EN_PUNTO;
+
+function exigirEnPunto(ingreso) {
+    if (!estaEnPunto(ingreso)) {
+        throw new ErrorApi(409, "El inventario de este punto ya fue cerrado y no se puede modificar.");
+    }
+}
+
+// ID_REGISTRO del ingreso: es el que une cada producto inventariado con la visita
+function idRegistroDe(ingreso) {
+    if (ingreso.ID_REGISTRO === undefined || ingreso.ID_REGISTRO === null || ingreso.ID_REGISTRO === "") {
+        console.error(`❌ El ingreso ${ingreso._id} no tiene ID_REGISTRO`);
+        throw new ErrorApi(409, "Tu visita no tiene un código de registro. Comunícate con tu coordinador.");
+    }
+    return ingreso.ID_REGISTRO;
+}
+
+// ========== INVENTARIO (un documento por producto) ==========
+// registro_inventario_unilevel: { EAN, DESC, CANTIDAD, FECHA_REGISTRO, HORA_REGISTRO, ID_REGISTRO, ESTADO }
+async function documentosDeVisita(idRegistro) {
+    const docs = await consultarColeccion(COLECCIONES.registros, { ID_REGISTRO: idRegistro });
+    return docs.filter(d => mismoValor(d.ID_REGISTRO, idRegistro) && d.EAN !== undefined && d.EAN !== null);
+}
+
+// EAN -> documento más reciente (por si quedara algún duplicado)
+function documentosPorEan(docs) {
+    const mapa = new Map();
+    for (const d of docs) {
+        const ean = String(d.EAN).trim();
+        const previo = mapa.get(ean);
+        if (!previo || String(d.created || "") > String(previo.created || "")) mapa.set(ean, d);
+    }
+    return mapa;
+}
+
+const tieneCantidad = doc => doc && Number.isInteger(Number(doc.CANTIDAD)) && Number(doc.CANTIDAD) >= 0
+    && doc.CANTIDAD !== null && doc.CANTIDAD !== "";
+const estaFinalizado = doc => doc && normalizarEstado(doc.ESTADO) === PRODUCTO_FINALIZADO;
+
+const marcaCompleta = (productos, porEan) => productos.length > 0 && productos.every(p => estaFinalizado(porEan.get(p.EAN)));
+const marcaBloqueada = (productos, porEan) => productos.some(p => estaFinalizado(porEan.get(p.EAN)));
+
+// Respuesta al front: misma forma de siempre (USUARIO, PUNTO_VENTA, MARCAS[...])
+async function construirVista(ingreso, docs) {
+    const catalogo = await obtenerProductos();
+    const porEan = documentosPorEan(docs);
+
+    const porMarca = new Map();
+    for (const p of catalogo) {
+        if (!porMarca.has(p.MARCA)) porMarca.set(p.MARCA, []);
+        porMarca.get(p.MARCA).push(p);
+    }
+
+    const MARCAS = [];
+    for (const [MARCA, productos] of porMarca) {
+        const PRODUCTOS = productos
+            .filter(p => tieneCantidad(porEan.get(p.EAN)))
+            .map(p => ({
+                PRODUCTO_ID: p.PRODUCTO_ID,
+                EAN: p.EAN,
+                DESC: p.DESC,
+                MARCA,
+                CANTIDAD: Number(porEan.get(p.EAN).CANTIDAD),
+            }));
+        if (PRODUCTOS.length === 0 && !marcaBloqueada(productos, porEan)) continue;
+        MARCAS.push({
+            MARCA,
+            ESTADO: marcaCompleta(productos, porEan) ? MARCA_FINALIZADA : MARCA_EN_PROCESO,
+            PRODUCTOS,
+        });
+    }
+
+    const todasFinalizadas = [...porMarca.values()].every(productos => marcaCompleta(productos, porEan));
+
     return {
-        INGRESO_ID: String(ingreso._id),
-        CODIGO: ingreso.SAP !== undefined && ingreso.SAP !== null ? String(ingreso.SAP) : null,
-        NOMBRE: ingreso.PDV ?? null,
-        CIUDAD: ingreso.CIUDAD ?? null,
-        FECHA_INGRESO: ingreso.FECHA_REGISTRO || ingreso.created || null,
+        _id: String(ingreso._id),
+        ID_REGISTRO: ingreso.ID_REGISTRO,
+        USUARIO: { CEDULA: String(ingreso.CEDULA ?? ""), NOMBRE: ingreso.NOMBRE ?? null },
+        PUNTO_VENTA: {
+            CODIGO: ingreso.SAP !== undefined && ingreso.SAP !== null ? String(ingreso.SAP) : null,
+            NOMBRE: ingreso.PDV ?? null,
+            CIUDAD: ingreso.CIUDAD ?? null,
+            ESTADO: ingreso.ESTADO ?? null,
+        },
+        MARCAS,
+        INVENTARIO_FINALIZADO: todasFinalizadas || !estaEnPunto(ingreso),
     };
-}
-
-// ========== REGISTROS ==========
-async function buscarRegistroPorId(id) {
-    const registros = await consultarColeccion(COLECCIONES.registros);
-    return registros.find(r => String(r._id) === String(id)) || null;
-}
-
-// Un registro de inventario por cada ingreso al punto de venta (cédula + ingreso del chatbot)
-async function buscarRegistroPorIngreso(cedula, ingresoId) {
-    const registros = await consultarColeccion(COLECCIONES.registros);
-    return registros.find(r =>
-        r.USUARIO && String(r.USUARIO.CEDULA) === cedula &&
-        r.PUNTO_VENTA && String(r.PUNTO_VENTA.INGRESO_ID) === ingresoId
-    ) || null;
-}
-
-async function obtenerRegistroOError(id) {
-    const registro = await buscarRegistroPorId(id);
-    if (!registro) throw new ErrorApi(404, "No encontramos tu registro de inventario. Vuelve a ingresar tu cédula.");
-    if (!Array.isArray(registro.MARCAS)) registro.MARCAS = [];
-    return registro;
 }
 
 // ========== ENDPOINTS ==========
@@ -235,55 +307,36 @@ app.get("/api/usuarios/:cedula", manejar(async (req, res) => {
     res.json({ existe: true, usuario });
 }));
 
-// Paso 1 (confirmado "Sí, soy yo"): crea o recupera el registro único de la persona
+// Paso 1 (confirmado "Sí, soy yo"): ubica la visita activa ("EN PUNTO") y devuelve su progreso
 app.post("/api/registros", manejar(async (req, res) => {
     const cedula = String((req.body && req.body.cedula) || "").trim();
     if (!soloDigitos(cedula)) {
         throw new ErrorApi(400, "La cédula solo debe tener números.");
     }
 
-    const registro = await conBloqueo(`cedula:${cedula}`, async () => {
-        const usuario = await buscarUsuario(cedula);
-        if (!usuario) throw new ErrorApi(404, "No encontramos tu cédula, verifícala e intenta de nuevo");
+    const usuario = await buscarUsuario(cedula);
+    if (!usuario) throw new ErrorApi(404, "No encontramos tu cédula, verifícala e intenta de nuevo");
 
-        const ingreso = await buscarIngresoDeHoy(cedula);
-        if (!ingreso) {
-            throw new ErrorApi(404,
-                "No encontramos tu ingreso a un punto de venta hoy. Primero indica en el chatbot a qué punto vas.");
-        }
-        const ingresoId = String(ingreso._id);
+    const ingreso = await buscarUltimoIngreso(cedula);
+    if (!ingreso) {
+        throw new ErrorApi(404,
+            "No encontramos tu ingreso a un punto de venta. Primero indica en el chatbot a qué punto vas.");
+    }
+    if (!estaEnPunto(ingreso)) {
+        throw new ErrorApi(409,
+            "Tu último punto de venta ya está cerrado. Registra en el chatbot el nuevo punto que vas a visitar.");
+    }
 
-        const existente = await buscarRegistroPorIngreso(cedula, ingresoId);
-        if (existente) {
-            console.log(`♻️ Registro recuperado para ${cedula}: ${existente._id}`);
-            return existente;
-        }
-
-        const { _id, created, ...datosUsuario } = usuario;
-        const fecha = ahora();
-        const nuevo = {
-            FECHA_REGISTRO: fecha,
-            FECHA_ACTUALIZACION: fecha,
-            USUARIO: { ...datosUsuario, CEDULA: cedula },
-            PUNTO_VENTA: puntoVentaDesdeIngreso(ingreso),
-            MARCAS: [],
-        };
-
-        const insertId = await crearDocumento(COLECCIONES.registros, nuevo);
-        const creado = insertId
-            ? { _id: insertId, ...nuevo }
-            : await buscarRegistroPorIngreso(cedula, ingresoId); // respaldo si no llega insert_id
-        if (!creado) throw new ErrorApi(502, "No pudimos crear tu registro. Intenta de nuevo.");
-        console.log(`🆕 Registro creado para ${cedula}: ${creado._id}`);
-        return creado;
-    });
-
-    res.json({ registro });
+    const docs = await documentosDeVisita(idRegistroDe(ingreso));
+    console.log(`📍 ${cedula} en punto ${ingreso.PDV} (ID_REGISTRO ${ingreso.ID_REGISTRO}) · ${docs.length} productos guardados`);
+    res.json({ registro: await construirVista(ingreso, docs) });
 }));
 
-// Recuperar progreso
+// Recuperar progreso (id = _id del ingreso en pdv_registro_unilevel)
 app.get("/api/registros/:id", manejar(async (req, res) => {
-    res.json({ registro: await obtenerRegistroOError(req.params.id) });
+    const ingreso = await obtenerIngresoOError(req.params.id);
+    const docs = await documentosDeVisita(idRegistroDe(ingreso));
+    res.json({ registro: await construirVista(ingreso, docs) });
 }));
 
 // Paso 2: marcas únicas en orden alfabético
@@ -319,83 +372,97 @@ app.put("/api/registros/:id/producto", manejar(async (req, res) => {
     const producto = (await obtenerProductos()).find(p => p.PRODUCTO_ID === String(productoId));
     if (!producto) throw new ErrorApi(404, "Este producto no existe en el catálogo.");
 
-    const registro = await conBloqueo(`registro:${id}`, async () => {
-        const reg = await obtenerRegistroOError(id);
-        const fecha = ahora();
+    const registro = await conBloqueo(`visita:${id}`, async () => {
+        const ingreso = await obtenerIngresoOError(id);
+        exigirEnPunto(ingreso);
+        const idRegistro = idRegistroDe(ingreso);
 
-        let marca = reg.MARCAS.find(m => normalizarMarca(m.MARCA) === producto.MARCA);
-        if (marca && marca.ESTADO === ESTADO_FINALIZADA) {
+        let docs = await documentosDeVisita(idRegistro);
+        const porEan = documentosPorEan(docs);
+
+        if (marcaBloqueada(await productosDeMarca(producto.MARCA), porEan)) {
             throw new ErrorApi(409, `La marca ${producto.MARCA} ya fue finalizada y no se puede editar.`);
         }
-        if (!marca) {
-            marca = { MARCA: producto.MARCA, ESTADO: ESTADO_EN_PROCESO, FECHA_FINALIZACION: null, PRODUCTOS: [] };
-            reg.MARCAS.push(marca);
+
+        const fechaHora = fechaYHoraLocal();
+        const existente = porEan.get(producto.EAN);
+
+        if (existente) {
+            const cambios = { CANTIDAD: valor, ...fechaHora };
+            await actualizarDocumento(COLECCIONES.registros, existente._id, cambios);
+            docs = docs.map(d => (d === existente ? { ...d, ...cambios } : d));
+        } else {
+            const nuevo = {
+                EAN: producto.EAN,
+                DESC: producto.DESC,
+                CANTIDAD: valor,
+                ...fechaHora,
+                ID_REGISTRO: idRegistro,
+                ESTADO: PRODUCTO_PENDIENTE,
+            };
+            const insertId = await crearDocumento(COLECCIONES.registros, nuevo);
+            docs = insertId
+                ? [...docs, { _id: insertId, created: ahora(), ...nuevo }]
+                : await documentosDeVisita(idRegistro); // respaldo si no llega insert_id
         }
-        if (!Array.isArray(marca.PRODUCTOS)) marca.PRODUCTOS = [];
 
-        const item = {
-            PRODUCTO_ID: producto.PRODUCTO_ID,
-            EAN: producto.EAN,
-            DESC: producto.DESC,
-            MARCA: producto.MARCA,
-            CANTIDAD: valor,
-            FECHA_ACTUALIZACION: fecha,
-        };
-        const indice = marca.PRODUCTOS.findIndex(p => String(p.PRODUCTO_ID) === producto.PRODUCTO_ID);
-        if (indice >= 0) marca.PRODUCTOS[indice] = item;
-        else marca.PRODUCTOS.push(item);
-
-        reg.FECHA_ACTUALIZACION = fecha;
-        await actualizarDocumento(COLECCIONES.registros, id, {
-            MARCAS: reg.MARCAS,
-            FECHA_ACTUALIZACION: fecha,
-        });
-        return reg;
+        return construirVista(ingreso, docs);
     });
 
     console.log(`💾 ${id} · ${producto.MARCA} · ${producto.EAN} = ${valor}`);
     res.json({ registro });
 }));
 
-// Paso 3: finalizar marca (después de esto el servidor rechaza cualquier cambio en ella)
+// Paso 3: finalizar marca. Todos sus productos pasan a FINALIZADO y el servidor rechaza
+// cualquier cambio posterior. Si era la última marca, el ingreso pasa a "FUERA DE PUNTO".
 app.post("/api/registros/:id/marcas/:marca/finalizar", manejar(async (req, res) => {
     const id = req.params.id;
     const nombreMarca = normalizarMarca(req.params.marca);
 
-    const catalogo = await productosDeMarca(nombreMarca);
-    if (catalogo.length === 0) throw new ErrorApi(404, "Esta marca no existe en el catálogo.");
+    const catalogoMarca = await productosDeMarca(nombreMarca);
+    if (catalogoMarca.length === 0) throw new ErrorApi(404, "Esta marca no existe en el catálogo.");
 
-    const registro = await conBloqueo(`registro:${id}`, async () => {
-        const reg = await obtenerRegistroOError(id);
-        const marca = reg.MARCAS.find(m => normalizarMarca(m.MARCA) === nombreMarca);
+    const resultado = await conBloqueo(`visita:${id}`, async () => {
+        const ingreso = await obtenerIngresoOError(id);
+        exigirEnPunto(ingreso);
+        const idRegistro = idRegistroDe(ingreso);
 
-        if (marca && marca.ESTADO === ESTADO_FINALIZADA) {
+        let docs = await documentosDeVisita(idRegistro);
+        let porEan = documentosPorEan(docs);
+
+        if (marcaCompleta(catalogoMarca, porEan)) {
             throw new ErrorApi(409, `La marca ${nombreMarca} ya estaba finalizada.`);
         }
 
-        const registrados = new Set(
-            ((marca && marca.PRODUCTOS) || [])
-                .filter(p => Number.isInteger(p.CANTIDAD) && p.CANTIDAD >= 0)
-                .map(p => String(p.PRODUCTO_ID))
-        );
-        const faltantes = catalogo.filter(p => !registrados.has(p.PRODUCTO_ID));
+        const faltantes = catalogoMarca.filter(p => !tieneCantidad(porEan.get(p.EAN)));
         if (faltantes.length > 0) {
             throw new ErrorApi(409, `Te faltan ${faltantes.length} productos por registrar.`, { faltantes });
         }
 
-        const fecha = ahora();
-        marca.ESTADO = ESTADO_FINALIZADA;
-        marca.FECHA_FINALIZACION = fecha;
-        reg.FECHA_ACTUALIZACION = fecha;
-        await actualizarDocumento(COLECCIONES.registros, id, {
-            MARCAS: reg.MARCAS,
-            FECHA_ACTUALIZACION: fecha,
-        });
-        return reg;
+        // Se marcan todos los documentos de la marca (incluye posibles duplicados por EAN)
+        const eanMarca = new Set(catalogoMarca.map(p => p.EAN));
+        const porFinalizar = docs.filter(d => eanMarca.has(String(d.EAN).trim()) && !estaFinalizado(d));
+        await enParalelo(porFinalizar, ENVIOS_SIMULTANEOS, d =>
+            actualizarDocumento(COLECCIONES.registros, d._id, { ESTADO: PRODUCTO_FINALIZADO })
+        );
+        const finalizados = new Set(porFinalizar.map(d => d._id));
+        docs = docs.map(d => (finalizados.has(d._id) ? { ...d, ESTADO: PRODUCTO_FINALIZADO } : d));
+        porEan = documentosPorEan(docs);
+        console.log(`✅ ${id} · marca ${nombreMarca} finalizada (${porFinalizar.length} productos)`);
+
+        // ¿Era la última marca? -> se cierra el ingreso al punto
+        const catalogo = await obtenerProductos();
+        const inventarioFinalizado = catalogo.every(p => estaFinalizado(porEan.get(p.EAN)));
+        if (inventarioFinalizado) {
+            await actualizarDocumento(COLECCIONES.ingresosPdv, ingreso._id, { ESTADO: PDV_FUERA_DE_PUNTO });
+            ingreso.ESTADO = PDV_FUERA_DE_PUNTO;
+            console.log(`🏁 ${id} · inventario completo, ingreso pasa a "${PDV_FUERA_DE_PUNTO}"`);
+        }
+
+        return { registro: await construirVista(ingreso, docs), inventarioFinalizado };
     });
 
-    console.log(`✅ ${id} · marca ${nombreMarca} finalizada`);
-    res.json({ registro });
+    res.json(resultado);
 }));
 
 // ========== HEALTH CHECK ==========
