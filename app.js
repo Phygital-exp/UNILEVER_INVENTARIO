@@ -355,13 +355,21 @@
         });
         select.addEventListener("change", () => { continuar.disabled = !select.value; });
 
+        // Al terminar todas las marcas el proxy cierra el ingreso (pasa a "fuera de punto"):
+        // se borra la sesión local para que la próxima visita empiece desde la cédula
+        const terminado = (finalizadas === total && total > 0) || Boolean(estado.registro && estado.registro.INVENTARIO_FINALIZADO);
+        if (terminado) borrarSesion();
+
         contenedor.replaceChildren(
             crear("div", { class: "progreso" }, [
                 crear("p", { class: "progreso__texto", text: `Marcas finalizadas: ${finalizadas} de ${total}` }),
                 crear("div", { class: "barra", "aria-hidden": "true" }, relleno),
             ]),
-            finalizadas === total && total > 0
-                ? crear("div", { class: "aviso aviso--exito", role: "status", text: "🎉 ¡Excelente! Finalizaste todas las marcas. Ya puedes cerrar esta página." })
+            terminado
+                ? crear("div", { class: "aviso aviso--exito", role: "status" }, [
+                    crear("p", { text: "🎉 ¡Excelente! Finalizaste todas las marcas. El inventario de este punto quedó cerrado." }),
+                    crear("button", { class: "btn btn--secundario", type: "button", text: "Salir", onclick: () => $("btn-salir").click() }),
+                ])
                 : crear("div", { class: "selector-marca" }, [
                     crear("label", { for: "select-marca", class: "etiqueta", text: "Marca" }),
                     select,
@@ -452,7 +460,7 @@
 
         const input = crear("input", {
             id: `cant-${id}`, class: "campo cantidad", type: "text", inputMode: "numeric",
-            autocomplete: "off", maxLength: MAX_DIGITOS, placeholder: "0", value: valor,
+            autocomplete: "off", maxLength: MAX_DIGITOS, placeholder: "Cantidad", value: valor,
             disabled: tipo === "bloqueada" || tipo === "guardado" || guardando,
             "data-id": id,
         });
@@ -695,7 +703,9 @@
             const datos = await api(CFG.RUTAS.finalizarMarca(estado.registro._id, marca), { method: "POST" });
             estado.registro = datos.registro;
             cerrarModal();
-            toast(`✓ Marca ${marca} finalizada`, "exito", 3500);
+            toast(datos.inventarioFinalizado
+                ? "✓ ¡Inventario completo! Terminaste todas las marcas de este punto."
+                : `✓ Marca ${marca} finalizada`, "exito", 4000);
             estado.marcaActual = null;
             irAMarcas();
         } catch (err) {
