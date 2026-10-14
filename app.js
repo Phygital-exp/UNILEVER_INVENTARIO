@@ -636,26 +636,45 @@
     });
 
     // ========== FINALIZAR MARCA ==========
+    // Cantidades escritas en pantalla que aún no se han enviado (o que cambian lo guardado).
+    // Una fila en edición con el campo vacío conserva su valor guardado.
+    function cantidadesSinEnviar() {
+        const guardadas = cantidadesGuardadas(estado.marcaActual);
+        const sinEnviar = [];
+        for (const p of estado.productos) {
+            const borrador = limpiarCantidad(estado.borradores.get(p.PRODUCTO_ID) || "");
+            if (borrador === "") continue;
+            if (guardadas.get(p.PRODUCTO_ID) === Number(borrador)) continue;
+            sinEnviar.push({ productoId: p.PRODUCTO_ID, cantidad: Number(borrador) });
+        }
+        return sinEnviar;
+    }
+
     $("btn-finalizar").addEventListener("click", () => {
         const marca = estado.marcaActual;
         if (marcaFinalizada(marca)) return;
 
-        if (estado.editando.size > 0) {
-            const id = [...estado.editando][0];
-            irAProducto(id);
-            toast("Tienes productos en edición. Envía o cancela esos cambios antes de finalizar.", "aviso", 4000);
+        if (estado.guardando.size > 0) {
+            toast("Espera un momento a que terminen de guardarse las cantidades enviadas.", "aviso", 3500);
             return;
         }
 
         const guardadas = cantidadesGuardadas(marca);
-        const faltantes = estado.productos.filter(p => !guardadas.has(p.PRODUCTO_ID));
+        const sinEnviar = cantidadesSinEnviar();
+        const conValor = new Set([...guardadas.keys(), ...sinEnviar.map(c => c.productoId)]);
+        const faltantes = estado.productos.filter(p => !conValor.has(p.PRODUCTO_ID));
         if (faltantes.length > 0) return modalFaltantes(faltantes);
+
+        const n = sinEnviar.length;
+        const texto = n > 0
+            ? `Se ${n === 1 ? "guardará 1 cantidad que aún no habías enviado" : `guardarán ${n} cantidades que aún no habías enviado`} y se finalizará la marca. Una vez finalizada no podrás editarla. ¿Confirmas?`
+            : "Una vez finalizada no podrás editar esta marca. ¿Confirmas?";
 
         abrirModal({
             titulo: `¿Finalizar ${marca}?`,
-            cuerpo: crear("p", { text: "Una vez finalizada no podrás editar esta marca. ¿Confirmas?" }),
+            cuerpo: crear("p", { text: texto }),
             botones: [
-                { texto: "Sí, finalizar", clase: "btn--primario", accion: e => confirmarFinalizar(e.currentTarget) },
+                { texto: n > 0 ? "Sí, guardar y finalizar" : "Sí, finalizar", clase: "btn--primario", accion: e => confirmarFinalizar(e.currentTarget, sinEnviar) },
                 { texto: "Cancelar", accion: cerrarModal },
             ],
         });
@@ -694,14 +713,20 @@
         if (input) setTimeout(() => input.focus({ preventScroll: true }), 350);
     }
 
-    async function confirmarFinalizar(boton) {
+    // Envía en un solo paso las cantidades pendientes de envío y finaliza la marca
+    async function confirmarFinalizar(boton, cantidades) {
         const marca = estado.marcaActual;
-        botonCargando(boton, true, "Finalizando…");
+        botonCargando(boton, true, cantidades.length > 0 ? "Guardando y finalizando…" : "Finalizando…");
         $("modal-botones").querySelectorAll("button").forEach(b => { b.disabled = true; });
 
         try {
-            const datos = await api(CFG.RUTAS.finalizarMarca(estado.registro._id, marca), { method: "POST" });
+            const datos = await api(CFG.RUTAS.finalizarMarca(estado.registro._id, marca), {
+                method: "POST",
+                body: { cantidades },
+            });
             estado.registro = datos.registro;
+            estado.editando.clear();
+            estado.borradores.clear();
             cerrarModal();
             toast(datos.inventarioFinalizado
                 ? "✓ ¡Inventario completo! Terminaste todas las marcas de este punto."
