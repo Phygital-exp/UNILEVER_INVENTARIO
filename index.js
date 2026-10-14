@@ -413,14 +413,36 @@ app.put("/api/registros/:id/producto", manejar(async (req, res) => {
     res.json({ registro });
 }));
 
-// Paso 3: finalizar marca. Todos sus productos pasan a FINALIZADO y el servidor rechaza
-// cualquier cambio posterior. Si era la última marca, el ingreso pasa a "FUERA DE PUNTO".
+// Valida las cantidades que el front envía al finalizar: [{ productoId, cantidad }] -> Map(EAN -> cantidad)
+function cantidadesDeMarca(lista, catalogoMarca) {
+    if (lista === undefined || lista === null) return new Map();
+    if (!Array.isArray(lista)) throw new ErrorApi(400, "Los datos enviados no son válidos.");
+
+    const porId = new Map(catalogoMarca.map(p => [p.PRODUCTO_ID, p]));
+    const resultado = new Map();
+    for (const item of lista) {
+        const producto = porId.get(String(item && item.productoId));
+        if (!producto) throw new ErrorApi(400, "Uno de los productos enviados no pertenece a esta marca.");
+        const texto = String(item.cantidad ?? "").trim();
+        if (!/^\d+$/.test(texto) || Number(texto) > CANTIDAD_MAXIMA) {
+            throw new ErrorApi(400, `La cantidad de ${producto.DESC} debe ser un número entero igual o mayor a 0.`);
+        }
+        resultado.set(producto.EAN, Number(texto));
+    }
+    return resultado;
+}
+
+// Paso 3: finalizar marca. Recibe opcionalmente { cantidades: [{ productoId, cantidad }] } con los
+// valores escritos que aún no se habían enviado: se guardan y se finaliza todo en un solo paso.
+// Todos los productos quedan en FINALIZADO y el servidor rechaza cualquier cambio posterior.
+// Si era la última marca, el ingreso pasa a "FUERA DE PUNTO".
 app.post("/api/registros/:id/marcas/:marca/finalizar", manejar(async (req, res) => {
     const id = req.params.id;
     const nombreMarca = normalizarMarca(req.params.marca);
 
     const catalogoMarca = await productosDeMarca(nombreMarca);
     if (catalogoMarca.length === 0) throw new ErrorApi(404, "Esta marca no existe en el catálogo.");
+    const nuevas = cantidadesDeMarca(req.body && req.body.cantidades, catalogoMarca);
 
     const resultado = await conBloqueo(`visita:${id}`, async () => {
         const ingreso = await obtenerIngresoOError(id);
@@ -434,21 +456,52 @@ app.post("/api/registros/:id/marcas/:marca/finalizar", manejar(async (req, res) 
             throw new ErrorApi(409, `La marca ${nombreMarca} ya estaba finalizada.`);
         }
 
-        const faltantes = catalogoMarca.filter(p => !tieneCantidad(porEan.get(p.EAN)));
+        // Se revisan faltantes ANTES de escribir nada, para no dejar la marca a medias
+        const faltantes = catalogoMarca.filter(p => !nuevas.has(p.EAN) && !tieneCantidad(porEan.get(p.EAN)));
         if (faltantes.length > 0) {
             throw new ErrorApi(409, `Te faltan ${faltantes.length} productos por registrar.`, { faltantes });
         }
 
-        // Se marcan todos los documentos de la marca (incluye posibles duplicados por EAN)
+        // Un solo POST por producto: guarda la cantidad (si llegó una nueva) y lo deja FINALIZADO
+        const fechaHora = fechaYHoraLocal();
+        const operaciones = [];
+        for (const p of catalogoMarca) {
+            const doc = porEan.get(p.EAN);
+            if (estaFinalizado(doc)) continue; // ya quedó finalizado en un intento anterior
+            const cantidad = nuevas.get(p.EAN);
+            if (!doc) {
+                operaciones.push(() => crearDocumento(COLECCIONES.registros, {
+                    EAN: p.EAN,
+                    DESC: p.DESC,
+                    CANTIDAD: cantidad,
+                    ...fechaHora,
+                    ID_REGISTRO: idRegistro,
+                    ESTADO: PRODUCTO_FINALIZADO,
+                }));
+            } else if (cantidad !== undefined && cantidad !== Number(doc.CANTIDAD)) {
+                operaciones.push(() => actualizarDocumento(COLECCIONES.registros, doc._id, {
+                    CANTIDAD: cantidad, ...fechaHora, ESTADO: PRODUCTO_FINALIZADO,
+                }));
+            } else {
+                operaciones.push(() => actualizarDocumento(COLECCIONES.registros, doc._id, { ESTADO: PRODUCTO_FINALIZADO }));
+            }
+        }
+
+        // Posibles documentos duplicados del mismo EAN también se finalizan
+        const principales = new Set([...porEan.values()].map(d => d._id));
         const eanMarca = new Set(catalogoMarca.map(p => p.EAN));
-        const porFinalizar = docs.filter(d => eanMarca.has(String(d.EAN).trim()) && !estaFinalizado(d));
-        await enParalelo(porFinalizar, ENVIOS_SIMULTANEOS, d =>
-            actualizarDocumento(COLECCIONES.registros, d._id, { ESTADO: PRODUCTO_FINALIZADO })
-        );
-        const finalizados = new Set(porFinalizar.map(d => d._id));
-        docs = docs.map(d => (finalizados.has(d._id) ? { ...d, ESTADO: PRODUCTO_FINALIZADO } : d));
+        for (const d of docs) {
+            if (!principales.has(d._id) && eanMarca.has(String(d.EAN).trim()) && !estaFinalizado(d)) {
+                operaciones.push(() => actualizarDocumento(COLECCIONES.registros, d._id, { ESTADO: PRODUCTO_FINALIZADO }));
+            }
+        }
+
+        await enParalelo(operaciones, ENVIOS_SIMULTANEOS, op => op());
+        console.log(`✅ ${id} · marca ${nombreMarca} finalizada (${operaciones.length} envíos, ${nuevas.size} cantidades nuevas)`);
+
+        // Se relee la visita para responder con lo que quedó realmente en la base
+        docs = await documentosDeVisita(idRegistro);
         porEan = documentosPorEan(docs);
-        console.log(`✅ ${id} · marca ${nombreMarca} finalizada (${porFinalizar.length} productos)`);
 
         // ¿Era la última marca? -> se cierra el ingreso al punto
         const catalogo = await obtenerProductos();
