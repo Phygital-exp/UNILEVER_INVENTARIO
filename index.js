@@ -217,8 +217,19 @@ function idRegistroDe(ingreso) {
     return ingreso.ID_REGISTRO;
 }
 
+// Datos de la persona y del punto que se guardan en cada producto inventariado (salen del ingreso)
+function datosPersonaYPunto(ingreso) {
+    return {
+        TELEFONO: ingreso.TELEFONO ?? null,
+        CEDULA: ingreso.CEDULA ?? null,
+        SAP: ingreso.SAP ?? null,
+        PDV: ingreso.PDV ?? null,
+    };
+}
+
 // ========== INVENTARIO (un documento por producto) ==========
-// registro_inventario_unilevel: { EAN, DESC, CANTIDAD, FECHA_REGISTRO, HORA_REGISTRO, ID_REGISTRO, ESTADO, MARCA }
+// registro_inventario_unilevel: { EAN, DESC, CANTIDAD, FECHA_REGISTRO, HORA_REGISTRO, ID_REGISTRO, ESTADO, MARCA,
+//                                 TELEFONO, CEDULA, SAP, PDV }
 async function documentosDeVisita(idRegistro) {
     const docs = await consultarColeccion(COLECCIONES.registros, { ID_REGISTRO: idRegistro });
     return docs.filter(d => mismoValor(d.ID_REGISTRO, idRegistro) && d.EAN !== undefined && d.EAN !== null);
@@ -400,6 +411,7 @@ app.put("/api/registros/:id/producto", manejar(async (req, res) => {
                 ID_REGISTRO: idRegistro,
                 ESTADO: PRODUCTO_PENDIENTE,
                 MARCA: producto.MARCA,
+                ...datosPersonaYPunto(ingreso),
             };
             const insertId = await crearDocumento(COLECCIONES.registros, nuevo);
             docs = insertId
@@ -465,6 +477,7 @@ app.post("/api/registros/:id/marcas/:marca/finalizar", manejar(async (req, res) 
 
         // Un solo POST por producto: guarda la cantidad (si llegó una nueva) y lo deja FINALIZADO
         const fechaHora = fechaYHoraLocal();
+        const datosVisita = datosPersonaYPunto(ingreso);
         const operaciones = [];
         for (const p of catalogoMarca) {
             const doc = porEan.get(p.EAN);
@@ -479,6 +492,7 @@ app.post("/api/registros/:id/marcas/:marca/finalizar", manejar(async (req, res) 
                     ID_REGISTRO: idRegistro,
                     ESTADO: PRODUCTO_FINALIZADO,
                     MARCA: p.MARCA,
+                    ...datosVisita,
                 }));
             } else if (cantidad !== undefined && cantidad !== Number(doc.CANTIDAD)) {
                 operaciones.push(() => actualizarDocumento(COLECCIONES.registros, doc._id, {
