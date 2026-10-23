@@ -3,6 +3,7 @@ const cors = require("cors");
 const fetch = require("node-fetch");
 const app = express();
 
+
 // ========== CONFIGURACIÓN (variables de entorno en Railway) ==========
 const PORT = process.env.PORT || 8080;
 const API_TOKEN = process.env.API_TOKEN;
